@@ -2,6 +2,7 @@ import torch
 from torch import Tensor
 from abc import ABC, abstractmethod
 from typing import Tuple, List
+import matplotlib.pyplot as plt
 
 
 class Actor(ABC, torch.nn.Module):
@@ -176,8 +177,8 @@ class PPO:
         self.__actor_num = env.get_actor_num()
         self.__discount_factor = discount_factor
         self.__time_steps_per_epoch = time_steps_per_epoch
-        self.__actor_optimizer = torch.optim.Adam(self.__actor.parameters())
-        self.__critic_optimizer = torch.optim.Adam(self.__critic.parameters())
+        self.__actor_optimizer = torch.optim.Adam(self.__actor.parameters(), lr=1e-4)
+        self.__critic_optimizer = torch.optim.Adam(self.__critic.parameters(), lr=1e-4)
         self.__actor_training_epochs = actor_training_epochs
         self.__critic_training_epochs = critic_training_epochs
         self.__actor_batch_size = actor_batch_size
@@ -201,6 +202,7 @@ class PPO:
         row_indices = torch.arange(size).unsqueeze(1).expand(size, size)
         col_indices = torch.arange(size).flip(0).unsqueeze(0).expand(size, size)
         sum_matrix = row_indices + col_indices
+
         return (
             (self.__discount_factor ** (sum_matrix.sub(size - 2).relu() - 1))
             .where(sum_matrix > size - 2, 0.0)
@@ -240,7 +242,8 @@ class PPO:
 
         rewards_to_go = self.reward_to_go(rewards)
 
-        advantages = rewards_to_go - self.__critic.forward(states)
+        advantages = rewards_to_go - self.__critic.forward(states).detach()
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         self.train_actor(states, actions, log_probs, advantages)
         self.train_critic(states, rewards_to_go)
@@ -257,6 +260,7 @@ class PPO:
             log_probs: [time_steps, actor_num]
             advantages: [time_steps, actor_num]
         """
+        self.__actor.train()
         for _ in range(self.__actor_training_epochs):
             indices = torch.randperm(self.__time_steps_per_epoch)
             states = states[indices].detach()
@@ -264,7 +268,6 @@ class PPO:
             log_probs = log_probs[indices].detach()
             advantages = advantages[indices].detach()
             for start in range(0, states.shape[0], self.__actor_batch_size):
-                self.__actor.train()
                 self.__actor_optimizer.zero_grad()
                 batch_states = states[start : start + self.__actor_batch_size]
                 batch_actions = actions[start : start + self.__actor_batch_size]
@@ -272,10 +275,13 @@ class PPO:
                 batch_advantages = advantages[start : start + self.__actor_batch_size]
                 new_log_probs = self.__actor.get_log_prob(batch_states, batch_actions)
                 ratio = torch.exp(new_log_probs - batch_log_probs)
-                surr_loss = (
+                surr_1 = ratio * batch_advantages
+                surr_2 = (
                     torch.clamp(ratio, 1.0 - self.__clip_ratio, 1.0 + self.__clip_ratio)
                     * batch_advantages
-                ).mean()
+                )
+                surr_loss = -torch.min(surr_1, surr_2).mean()
+                print("surr_loss", surr_loss.item())
                 surr_loss.backward()
                 self.__actor_optimizer.step()
 
@@ -285,12 +291,13 @@ class PPO:
             states: [time_steps, actor_num, state_dim]
             rewards_to_go: [time_steps, actor_num]
         """
+        self.__critic.train()
         for _ in range(self.__critic_training_epochs):
             indices = torch.randperm(self.__time_steps_per_epoch)
             states = states[indices]
             rewards_to_go = rewards_to_go[indices]
+            total_loss = 0
             for start in range(0, states.shape[0], self.__critic_batch_size):
-                self.__critic.train()
                 self.__critic_optimizer.zero_grad()
                 batch_states = states[start : start + self.__critic_batch_size]
                 batch_rewards_to_go = rewards_to_go[
@@ -302,7 +309,9 @@ class PPO:
                     )
                 )
                 loss.backward()
+                total_loss += loss
                 self.__critic_optimizer.step()
+            print("mean_loss", total_loss / self.__critic_training_epochs)
 
 
 import torch.nn as nn
@@ -316,18 +325,19 @@ class MyActor(Actor):
         self.__actor_dim = actor_dim
         self.__actor_num = actor_num
         self.__network = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, 32),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(32, 32),
             nn.ReLU(),
         )
-        self.__mu = nn.Linear(128, actor_dim)
-        self.__sigma = nn.Linear(128, actor_dim)
+        self.__mu = nn.Linear(32, actor_dim)
+        self.__sigma = nn.Linear(32, actor_dim)
 
     def forward(self, state: Tensor) -> Tuple[Tensor, Tensor]:
         x = self.__network(state)
         mu = self.__mu(x)
-        sigma = torch.square(self.__sigma(x))
+        sigma = torch.exp(self.__sigma(x))
+        # check if sigma is positive
         action = torch.distributions.Normal(mu, sigma).sample()
         log_prob = torch.distributions.Normal(mu, sigma).log_prob(action).sum(dim=2)
         return action, log_prob
@@ -335,7 +345,7 @@ class MyActor(Actor):
     def get_log_prob(self, state: Tensor, action: Tensor) -> Tensor:
         x = self.__network(state)
         mu = self.__mu(x)
-        sigma = torch.square(self.__sigma(x))
+        sigma = torch.exp(self.__sigma(x))
         return torch.distributions.Normal(mu, sigma).log_prob(action).sum(dim=2)
 
     def get_state_dim(self) -> int:
@@ -358,11 +368,11 @@ class MyCritic(Critic):
         self.__mini_batch_size = mini_batch_size
         self.__training_epochs = training_epochs
         self.__network = nn.Sequential(
-            nn.Linear(state_dim, 128),
+            nn.Linear(state_dim, 32),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(32, 32),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(32, 1),
         )
 
     def forward(self, state: Tensor) -> Tensor:
@@ -414,7 +424,8 @@ class MyEnvironment(Environment):
         return self.__actor_num
 
 
-env = MyEnvironment(16, 1 / 60)
+torch.autograd.set_detect_anomaly(True)
+env = MyEnvironment(256, 1 / 60)
 act = MyActor(env.get_action_dim(), env.get_state_dim(), env.get_actor_num())
 crit = MyCritic(env.get_state_dim(), env.get_actor_num, 32, 4)
 ppo = PPO(
@@ -423,11 +434,11 @@ ppo = PPO(
     env,
     clip_ratio=0.1,
     time_steps_per_epoch=128,
-    discount_factor=0.99,
-    actor_training_epochs=4,
-    critic_training_epochs=4,
-    actor_batch_size=64,
-    critic_batch_size=64,
+    discount_factor=0.9,
+    actor_training_epochs=32,
+    critic_training_epochs=32,
+    actor_batch_size=32,
+    critic_batch_size=32,
 )
 
 for _ in range(100):
